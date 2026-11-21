@@ -1,8 +1,12 @@
 package com.winamp.reborn
 
+import android.Manifest
 import android.content.ComponentName
+import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -29,12 +33,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -42,7 +50,6 @@ import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.util.Locale
-import java.util.concurrent.Executors
 
 private val Bg = Color(0xFF080B0D)
 private val Panel = Color(0xFF151B1F)
@@ -53,33 +60,77 @@ class MainActivity : ComponentActivity() {
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private var mediaController: MediaController? = null
 
+    private fun savedUris(): List<String> =
+        (getSharedPreferences("playlist", MODE_PRIVATE).getString("uris", "") ?: "")
+            .split("\n").filter { it.isNotBlank() }
+
+    private fun saveUris(list: List<String>) {
+        getSharedPreferences("playlist", MODE_PRIVATE).edit()
+            .putString("uris", list.joinToString("\n")).apply()
+    }
+
+    private fun nameOf(uri: Uri): String =
+        runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { if (it.moveToFirst()) it.getString(0) else null }
+        }.getOrNull() ?: uri.lastPathSegment ?: "Track"
+
+    private fun itemOf(uri: Uri): MediaItem =
+        MediaItem.Builder().setUri(uri)
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(nameOf(uri)).build())
+            .build()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+                .launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         val token = SessionToken(this, ComponentName(this, PlaybackService::class.java))
-        controllerFuture = MediaController.Builder(this, token).setListener(object : MediaController.Listener {}).buildAsync()
+        controllerFuture = MediaController.Builder(this, token).buildAsync()
         controllerFuture?.addListener({
-            runCatching { mediaController = controllerFuture?.get() }
-        }, Executors.newSingleThreadExecutor())
+            runCatching {
+                val c = controllerFuture?.get()
+                mediaController = c
+                if (c != null && c.mediaItemCount == 0) {
+                    val items = savedUris().map { itemOf(Uri.parse(it)) }
+                    if (items.isNotEmpty()) {
+                        c.setMediaItems(items)
+                        c.prepare()
+                    }
+                }
+            }
+        }, ContextCompat.getMainExecutor(this))
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Green, background = Bg, surface = Panel)) {
-                WinampScreen(
-                    getController = { mediaController },
-                    onPickFiles = { uris ->
-                        val c = mediaController ?: return@WinampScreen
-                        val items = uris.map { uri -> MediaItem.fromUri(uri) }
-                        c.addMediaItems(items)
-                        if (c.mediaItemCount > 0 && !c.isPlaying && c.playbackState == Player.STATE_IDLE) c.prepare()
-                        if (c.mediaItemCount > 0 && c.currentMediaItem == null) c.seekToDefaultPosition(0)
-                    }
-                )
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    WinampScreen(
+                        getController = { mediaController },
+                        onPickFiles = { uris ->
+                            val c = mediaController
+                            if (c != null) {
+                                uris.forEach {
+                                    runCatching {
+                                        contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                }
+                                c.addMediaItems(uris.map { itemOf(it) })
+                                if (c.playbackState == Player.STATE_IDLE) c.prepare()
+                                saveUris(savedUris() + uris.map { it.toString() })
+                            }
+                        }
+                    )
+                }
             }
         }
     }
 
     override fun onDestroy() {
-        mediaController?.release()
         controllerFuture?.let { MediaController.releaseFuture(it) }
+        mediaController = null
         super.onDestroy()
     }
 }
@@ -104,12 +155,11 @@ private fun WinampScreen(getController: () -> MediaController?, onPickFiles: (Li
     }
     val c = controller
     val current = c?.currentMediaItem
-    val title = current?.mediaMetadata?.title?.toString()
-        ?: current?.localConfiguration?.uri?.lastPathSegment ?: "WINAMP REBORN"
+    val title = current?.mediaMetadata?.title?.toString() ?: "WINAMP REBORN"
     val duration = (c?.duration ?: 0L).coerceAtLeast(0L)
     val position = (c?.currentPosition ?: 0L).coerceAtLeast(0L)
-    val playlist = (0 until (c?.mediaItemCount ?: 0)).mapNotNull { index ->
-        c?.getMediaItemAt(index)?.let { it.mediaMetadata.title?.toString() ?: it.localConfiguration?.uri?.lastPathSegment ?: "Track ${index + 1}" }
+    val playlist = (0 until (c?.mediaItemCount ?: 0)).map { index ->
+        c?.getMediaItemAt(index)?.mediaMetadata?.title?.toString() ?: "Track ${index + 1}"
     }
 
     Column(
@@ -121,7 +171,7 @@ private fun WinampScreen(getController: () -> MediaController?, onPickFiles: (Li
                 Text("WINAMP", color = Green, fontSize = 27.sp, fontWeight = FontWeight.Black, fontFamily = FontFamily.Monospace, letterSpacing = 2.sp)
                 Text("REBORN  •  ANDROID PLAYER", color = Cyan, fontSize = 9.sp, letterSpacing = 2.sp)
             }
-            Text("2.0", color = Color.LightGray, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
+            Text("2.1", color = Color.LightGray, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
         }
 
         Column(Modifier.fillMaxWidth().background(Panel, RoundedCornerShape(8.dp)).padding(14.dp)) {
@@ -136,10 +186,12 @@ private fun WinampScreen(getController: () -> MediaController?, onPickFiles: (Li
                 }
                 Text(if (c?.isPlaying == true) "PLAY" else "READY", color = Green, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
             }
-            Spacer(Modifier.height(14.dp))
-            LinearProgressIndicator(
-                progress = { if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f },
-                modifier = Modifier.fillMaxWidth().height(5.dp), color = Green, trackColor = Color(0xFF39464B)
+            Spacer(Modifier.height(6.dp))
+            Slider(
+                value = if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f,
+                onValueChange = { if (duration > 0) c?.seekTo((it * duration).toLong()) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = SliderDefaults.colors(thumbColor = Green, activeTrackColor = Green, inactiveTrackColor = Color(0xFF39464B))
             )
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(formatTime(position), color = Cyan, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
@@ -204,10 +256,10 @@ private fun EqualizerPanel() {
     val bands = remember { mutableStateListOf(0.0f, 0.0f, 0.0f, 0.0f, 0.0f) }
     Column(Modifier.fillMaxWidth().background(Color(0xFF11191D), RoundedCornerShape(8.dp)).padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("10-BAND EQUALIZER", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text("5-BAND EQUALIZER", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             Switch(checked = enabled, onCheckedChange = { enabled = it })
         }
-        Text(if (enabled) "واجهة التحكم جاهزة — ربط المعالجة الصوتية الفعلية في المرحلة التالية" else "المعادل معروض؛ تأثيرات الصوت لم تُفعّل بعد", color = Color.Gray, fontSize = 9.sp)
+        Text("المعادل شكلي حالياً، تأثيرات الصوت لم تُفعّل بعد", color = Color.Gray, fontSize = 9.sp)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("60", "230", "910", "3.6k", "14k").forEachIndexed { i, label ->
                 Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
